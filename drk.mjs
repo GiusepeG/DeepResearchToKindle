@@ -3,18 +3,19 @@
 /**
  * Deep Research to Kindle (DRK)
  *
- * Automates: Gemini Deep Research → HTML Capture → Send to Kindle
+ * Fluxo:
+ *   Gemini Deep Research → Google Docs → EPUB → Send to Kindle
  *
  * Usage:
  *   node drk.mjs "Your research query"
- *   node drk.mjs --login-only
+ *   node drk.mjs --model flash "query"       Usar modelo Flash
+ *   node drk.mjs --send-only <gemini-url>    Exportar pesquisa existente
+ *   node drk.mjs --login-only                Abrir browser para login
  */
 
 import { chromium } from "playwright";
-import { marked } from "marked";
-import { execSync } from "child_process";
-import { readFileSync, writeFileSync, existsSync } from "fs";
-import { resolve, dirname } from "path";
+import { existsSync, readdirSync, statSync } from "fs";
+import { resolve, dirname, extname } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
 
@@ -24,592 +25,675 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const PROFILE_DIR = resolve(homedir(), ".drk-profile");
-const TEMPLATE_PATH = resolve(__dirname, "template.html");
 const DOWNLOADS_DIR = resolve(homedir(), "Downloads");
 const GEMINI_URL = "https://gemini.google.com/app";
-const KINDLE_URL = "https://www.amazon.com.br/sendtokindle";
+const SEND_TO_KINDLE_URL = "https://www.amazon.com.br/sendtokindle";
 
-const POLL_INTERVAL_MS = 30_000; // 30 seconds
-const MAX_POLL_TIME_MS = 15 * 60_000; // 15 minutes
+const POLL_INTERVAL_MS = 30_000;
+const MAX_POLL_TIME_MS = 15 * 60_000;
+
+const TOTAL_STEPS = 7;
+
+// ─── Models ────────────────────────────────────────────────────────────────────
+
+const MODELS = [
+    { key: "1", label: "⚡ Rápido (Flash)", geminiName: "Rápido", testId: "bard-mode-option-rápido" },
+    { key: "2", label: "🧠 Raciocínio (Thinking)", geminiName: "Raciocínio", testId: "bard-mode-option-raciocínio" },
+    { key: "3", label: "🚀 Pro", geminiName: "Pro", testId: "bard-mode-option-pro" },
+];
+
+// ─── CLI Logging ───────────────────────────────────────────────────────────────
+
+const SEPARATOR = "━".repeat(50);
+
+function ts() {
+    return new Date().toLocaleTimeString("pt-BR");
+}
+
+function log(msg) {
+    console.log(`[DRK ${ts()}] ${msg}`);
+}
+
+function logStep(step, msg) {
+    console.log(`[DRK ${ts()}] [${step}/${TOTAL_STEPS}] ${msg}`);
+}
+
+function logSub(msg) {
+    console.log(`[DRK ${ts()}]        ${msg}`);
+}
+
+function logBanner() {
+    console.log();
+    log(SEPARATOR);
+    log("📚 Deep Research to Kindle");
+    log("   Gemini → Google Docs → EPUB → Kindle");
+    log(SEPARATOR);
+}
+
+// ─── Model Resolution ──────────────────────────────────────────────────────────
+
+const DEFAULT_MODEL = MODELS[1]; // Raciocínio (Thinking) is the default
+
+function resolveModel(modelArg) {
+    if (!modelArg) return DEFAULT_MODEL;
+    const lower = modelArg.toLowerCase();
+    // Match by key, name, or alias
+    const aliases = {
+        "1": MODELS[0], "flash": MODELS[0], "rapido": MODELS[0], "rápido": MODELS[0],
+        "2": MODELS[1], "thinking": MODELS[1], "raciocinio": MODELS[1], "raciocínio": MODELS[1],
+        "3": MODELS[2], "pro": MODELS[2],
+    };
+    return aliases[lower] || DEFAULT_MODEL;
+}
 
 // ─── Utilities ─────────────────────────────────────────────────────────────────
 
-function log(msg) {
-  const ts = new Date().toLocaleTimeString("pt-BR");
-  console.log(`[DRK ${ts}] ${msg}`);
-}
-
-function sanitizeFilename(text) {
-  return text
-    .replace(/[^\w\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .substring(0, 80)
-    .replace(/-+$/, "");
-}
-
 function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+    return new Promise((r) => setTimeout(r, ms));
 }
 
-function readClipboard() {
-  try {
-    return execSync("pbpaste", { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
-  } catch {
-    return "";
-  }
-}
+/**
+ * Find the most recent .epub file in Downloads that appeared after `afterTime`.
+ */
+function findRecentEpub(afterTime) {
+    try {
+        const files = readdirSync(DOWNLOADS_DIR)
+            .filter((f) => extname(f).toLowerCase() === ".epub")
+            .map((f) => {
+                const fullPath = resolve(DOWNLOADS_DIR, f);
+                const stat = statSync(fullPath);
+                return { path: fullPath, name: f, mtime: stat.mtimeMs };
+            })
+            .filter((f) => f.mtime > afterTime)
+            .sort((a, b) => b.mtime - a.mtime);
 
-function buildHtml(title, markdownContent) {
-  const template = readFileSync(TEMPLATE_PATH, "utf-8");
-  const htmlContent = marked.parse(markdownContent);
-  const date = new Date().toLocaleDateString("pt-BR", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
-
-  return template
-    .replace(/\{\{TITLE\}\}/g, title)
-    .replace("{{CONTENT}}", htmlContent)
-    .replace("{{DATE}}", date);
+        return files.length > 0 ? files[0] : null;
+    } catch {
+        return null;
+    }
 }
 
 // ─── Browser Helpers ───────────────────────────────────────────────────────────
 
 async function launchBrowser(profilePath = PROFILE_DIR) {
-  log(`Launching browser (profile: ${profilePath})`);
-  const context = await chromium.launchPersistentContext(profilePath, {
-    headless: false,
-    viewport: { width: 1280, height: 900 },
-    args: ["--disable-blink-features=AutomationControlled"],
-  });
-  const page = context.pages()[0] || (await context.newPage());
-  return { context, page };
+    logStep(1, "🚀 Lançando navegador...");
+    logSub(`Perfil: ${profilePath}`);
+
+    const context = await chromium.launchPersistentContext(profilePath, {
+        headless: false,
+        viewport: { width: 1280, height: 900 },
+        args: ["--disable-blink-features=AutomationControlled"],
+        acceptDownloads: true,
+    });
+    const page = context.pages()[0] || (await context.newPage());
+
+    logSub("✅ Navegador pronto.");
+    return { context, page };
 }
 
-async function navigateToGemini(page) {
-  log("Navigating to Gemini...");
-  await page.goto(GEMINI_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
-  // Wait for the chat input to be ready
-  await page.waitForTimeout(3000);
-  log("Gemini loaded.");
+async function navigateToGemini(page, url = GEMINI_URL) {
+    logStep(2, "🌐 Navegando para o Gemini...");
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.waitForTimeout(3000);
+    logSub("✅ Gemini carregado.");
+}
+
+// ─── Model Selection ───────────────────────────────────────────────────────────
+
+async function selectModel(page, model) {
+    logStep(3, `🔧 Selecionando modelo: ${model.geminiName}...`);
+
+    try {
+        const dropdownIcon = page.locator('mat-icon.dropdown-icon[fonticon="keyboard_arrow_down"]').first();
+        await dropdownIcon.waitFor({ state: "visible", timeout: 10_000 });
+        await dropdownIcon.click();
+        await page.waitForTimeout(1500);
+        logSub("Menu de modelos aberto.");
+
+        const modelOption = page.locator(`button[data-test-id="${model.testId}"]`).first();
+        await modelOption.waitFor({ state: "visible", timeout: 5_000 });
+        await modelOption.click();
+        await page.waitForTimeout(1000);
+
+        logSub(`✅ Modelo ${model.geminiName} selecionado.`);
+    } catch (err) {
+        logSub(`⚠️  Erro ao selecionar modelo: ${err.message}`);
+        logSub("Continuando com modelo padrão...");
+    }
 }
 
 // ─── Deep Research Flow ────────────────────────────────────────────────────────
 
 async function enableDeepResearch(page) {
-  log('Enabling Deep Research mode...');
+    logSub("🔬 Ativando Deep Research...");
+    const toolsBtn = page.getByRole("button", { name: /Ferramentas/i });
+    await toolsBtn.waitFor({ state: "visible", timeout: 10_000 });
+    await toolsBtn.click();
+    await page.waitForTimeout(1500);
 
-  // Click "Ferramentas" (Tools button)
-  const toolsBtn = page.getByRole("button", { name: /Ferramentas/i });
-  await toolsBtn.waitFor({ state: "visible", timeout: 10_000 });
-  await toolsBtn.click();
-  await page.waitForTimeout(1500);
-
-  // Click "Deep Research" in the dropdown
-  const drBtn = page.locator('text=/Deep Research/i');
-  await drBtn.waitFor({ state: "visible", timeout: 5_000 });
-  await drBtn.click();
-  await page.waitForTimeout(2000);
-
-  log("Deep Research mode enabled.");
+    const drBtn = page.locator("text=/Deep Research/i");
+    await drBtn.waitFor({ state: "visible", timeout: 5_000 });
+    await drBtn.click();
+    await page.waitForTimeout(2000);
+    logSub("✅ Deep Research ativado.");
 }
 
 async function submitQuery(page, query) {
-  log(`Submitting query: "${query.substring(0, 50)}..."`);
+    logStep(4, `📝 Enviando query: "${query.substring(0, 60)}..."`);
 
-  // Wait for the input area
-  // Often a contenteditable div or textarea
-  const input = page.locator('rich-textarea div[contenteditable="true"], textarea, div[role="textbox"]').first();
-  await input.waitFor({ state: "visible", timeout: 15_000 });
+    const input = page
+        .locator('rich-textarea div[contenteditable="true"], textarea, div[role="textbox"]')
+        .first();
+    await input.waitFor({ state: "visible", timeout: 15_000 });
+    await input.click();
+    await input.fill(query);
+    await page.waitForTimeout(1000);
 
-  // Type the query
-  await input.click();
-  await input.fill(query);
-  await page.waitForTimeout(1000); // Brief pause
-
-  // Press Enter to submit
-  log("Pressing Enter to submit...");
-  await page.keyboard.press('Enter');
-
-  // Wait for the response to start generating or the input to clear/change state
-  await page.waitForTimeout(2000);
-
-  log("Query submitted.");
+    logSub("Pressionando Enter...");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(2000);
+    logSub("✅ Query enviada.");
 }
 
 async function confirmResearchStart(page) {
-  log('Looking for "Iniciar investigação/pesquisa" confirmation...');
+    logSub('🔍 Procurando botão "Iniciar investigação"...');
 
-  // The new Deep Research flow presents a plan first.
-  // We must click "Iniciar investigação", "Start research", or similar.
-  // Common labels: "Iniciar investigação", "Start", "Confirm", "Looks good", "Iniciar"
+    const possibleButtons = [
+        /Iniciar investigação/i,
+        /Start investigation/i,
+        /Iniciar pesquisa/i,
+        /Start research/i,
+        /Looks good/i,
+        /Confirmar/i,
+    ];
 
-  const possibleButtons = [
-    /Iniciar investigação/i,
-    /Start investigation/i,
-    /Iniciar pesquisa/i,
-    /Start research/i,
-    /Looks good/i,
-    /Confirmar/i
-  ];
+    const startTime = Date.now();
+    const maxWait = 60_000;
 
-  const startTime = Date.now();
-  const maxWait = 60_000; // Wait up to 60s for the plan to appear and the button to be clickable
+    while (Date.now() - startTime < maxWait) {
+        try {
+            for (const label of possibleButtons) {
+                const btn = page.getByRole("button", { name: label }).first();
+                if (await btn.isVisible()) {
+                    logSub(`Botão encontrado: "${label}"`);
+                    await btn.click();
+                    logSub("✅ Pesquisa iniciada (plano confirmado).");
+                    await page.waitForTimeout(5000);
+                    return;
+                }
+            }
 
-  while (Date.now() - startTime < maxWait) {
-    try {
-      // Check for any of the buttons
-      for (const label of possibleButtons) {
-        const btn = page.getByRole("button", { name: label }).first();
-        if (await btn.isVisible()) {
-          log(`Found confirmation button: "${label}"`);
-          await btn.click();
-          log("Research started (Plan confirmed).");
-          await page.waitForTimeout(5000); // Wait for UI transition
-          return;
+            const looseBtn = page
+                .locator('button:has-text("Iniciar"), button:has-text("Start")')
+                .first();
+            if (await looseBtn.isVisible()) {
+                const text = await looseBtn.innerText();
+                if (text.includes("investiga") || text.includes("pesquisa")) {
+                    logSub(`Botão encontrado (loose): "${text}"`);
+                    await looseBtn.click();
+                    await page.waitForTimeout(5000);
+                    return;
+                }
+            }
+        } catch {
+            // Ignore and keep polling
         }
-      }
-
-      // Also check for "Editar plano" (Edit plan) which implies the plan is visible. 
-      // If we see "Editar plano" but no start button yet, we wait.
-      // If the start button is there but strict mode failed, try loose locator.
-      const looseBtn = page.locator('button:has-text("Iniciar"), button:has-text("Start")').first();
-      if (await looseBtn.isVisible()) {
-        // Filter out "New chat" or other irrelevant buttons if needed
-        // But usually "Iniciar" in this context is correct.
-        const text = await looseBtn.innerText();
-        if (text.includes("investiga") || text.includes("pesquisa")) {
-          log(`Found loose confirmation button: "${text}"`);
-          await looseBtn.click();
-          await page.waitForTimeout(5000);
-          return;
-        }
-      }
-
-    } catch (e) {
-      // Ignore errors and keep polling
+        await page.waitForTimeout(2000);
     }
-    await page.waitForTimeout(2000);
-  }
-
-  log("⚠️ No confirmation button found after 60s. Research may have started automatically or selector changed.");
+    logSub("⚠️  Nenhum botão de confirmação encontrado após 60s.");
 }
 
 async function pollForCompletion(page) {
-  log("Polling for research completion...");
-  const startTime = Date.now();
+    logSub("⏳ Aguardando conclusão da pesquisa...");
+    const startTime = Date.now();
 
-  // Gemini Deep Research uses a status chip: deep-research-entry-chip-content
-  // When complete, it shows "Concluído" (Portuguese) or "Completed" (English).
-  // We also check for the immersive report container to appear.
+    // Phase 1: Detect start
+    logSub("Fase 1: Detectando início da pesquisa...");
+    let researchStarted = false;
+    const phase1Deadline = Date.now() + 120_000;
 
-  // --- Phase 1: Wait for research to START ---
-  log("  Phase 1: Waiting for research to begin...");
+    while (Date.now() < phase1Deadline) {
+        const chipStatus = await page.evaluate(() => {
+            const chip = document.querySelector("deep-research-entry-chip-content");
+            return chip ? chip.innerText.trim() : "";
+        }).catch(() => "");
 
-  let researchStarted = false;
-  const phase1Deadline = Date.now() + 120_000; // 2 min max
+        if (chipStatus) {
+            logSub(`Status detectado: "${chipStatus}"`);
+            researchStarted = true;
+            if (/Conclu[íi]do|Completed/i.test(chipStatus)) {
+                logSub("✅ Pesquisa já concluída!");
+                break;
+            }
+            break;
+        }
 
-  while (Date.now() < phase1Deadline) {
-    // Check for the Deep Research status chip (appears during research)
-    const chipStatus = await page.evaluate(() => {
-      const chip = document.querySelector('deep-research-entry-chip-content');
-      return chip ? chip.innerText.trim() : '';
-    }).catch(() => '');
-
-    if (chipStatus) {
-      log(`  ✓ Deep Research status detected: "${chipStatus}"`);
-      researchStarted = true;
-      // If already completed, skip to phase 2
-      if (/Conclu[íi]do|Completed/i.test(chipStatus)) {
-        log("  ✓ Research already completed!");
-        break;
-      }
-      break;
+        const indicators = page.locator("text=/Pesquisando|Researching|Analisando|Analyzing/i");
+        if (await indicators.isVisible().catch(() => false)) {
+            logSub("Atividade de pesquisa detectada.");
+            researchStarted = true;
+            break;
+        }
+        await sleep(5_000);
     }
 
-    // Also check for text indicators
-    const indicators = page.locator('text=/Pesquisando|Researching|Analisando|Analyzing/i');
-    if (await indicators.isVisible().catch(() => false)) {
-      log("  ✓ Research activity detected.");
-      researchStarted = true;
-      break;
+    if (!researchStarted) {
+        logSub("⚠️  Não detectou início. Continuando polling...");
     }
 
-    await sleep(5_000);
-  }
+    // Phase 2: Wait for completion
+    logSub("Fase 2: Aguardando conclusão...");
+    const minWaitUntil = Date.now() + 60_000;
 
-  if (!researchStarted) {
-    log("  ⚠️  Could not detect research start, proceeding to poll for completion...");
-  }
+    while (Date.now() - startTime < MAX_POLL_TIME_MS) {
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
 
-  // --- Phase 2: Wait for COMPLETION ---
-  log("  Phase 2: Waiting for research to complete...");
+        const chipStatus = await page.evaluate(() => {
+            const chip = document.querySelector("deep-research-entry-chip-content");
+            return chip ? chip.innerText.trim() : "";
+        }).catch(() => "");
 
-  // Minimum wait after start before checking completion
-  const minWaitUntil = Date.now() + 60_000;
+        if (/Conclu[íi]do|Completed/i.test(chipStatus)) {
+            await sleep(5_000);
+            logSub(`✅ Pesquisa concluída! Status: "${chipStatus}" (${elapsed}s)`);
+            return true;
+        }
 
-  while (Date.now() - startTime < MAX_POLL_TIME_MS) {
-    const elapsed = Math.round((Date.now() - startTime) / 1000);
-    log(`  ⏳ Polling... (${elapsed}s elapsed)`);
+        if (chipStatus && !/Conclu[íi]do|Completed/i.test(chipStatus)) {
+            logSub(`⏳ Polling... (${elapsed}s) — Status: "${chipStatus}"`);
+            await sleep(POLL_INTERVAL_MS);
+            continue;
+        }
 
-    // Primary: Check Deep Research status chip for "Concluído"
-    const chipStatus = await page.evaluate(() => {
-      const chip = document.querySelector('deep-research-entry-chip-content');
-      return chip ? chip.innerText.trim() : '';
-    }).catch(() => '');
+        if (Date.now() < minWaitUntil) {
+            logSub(`⏳ Polling... (${elapsed}s)`);
+            await sleep(10_000);
+            continue;
+        }
 
-    if (/Conclu[íi]do|Completed/i.test(chipStatus)) {
-      // Wait a bit more for the report to fully render
-      await sleep(5_000);
-      log('✅ Research complete! Status: "' + chipStatus + '"');
-      return true;
+        const reportLength = await page.evaluate(() => {
+            const container = document.querySelector('.container[scrollable="true"]');
+            return container ? (container.innerText || "").trim().length : 0;
+        }).catch(() => 0);
+
+        if (reportLength > 500) {
+            logSub(`✅ Pesquisa concluída! Relatório com ${reportLength} caracteres. (${elapsed}s)`);
+            return true;
+        }
+
+        logSub(`⏳ Polling... (${elapsed}s)`);
+        await sleep(POLL_INTERVAL_MS);
     }
 
-    // If chip shows active status, keep waiting
-    if (chipStatus && !/Conclu[íi]do|Completed/i.test(chipStatus)) {
-      log(`  📊 Status: "${chipStatus}"`);
-      await sleep(POLL_INTERVAL_MS);
-      continue;
-    }
-
-    // If we haven't waited the minimum time yet, keep waiting
-    if (Date.now() < minWaitUntil) {
-      await sleep(10_000);
-      continue;
-    }
-
-    // Fallback: check if the immersive report container has content
-    const reportLength = await page.evaluate(() => {
-      const container = document.querySelector('.container[scrollable="true"]');
-      return container ? (container.innerText || '').trim().length : 0;
-    }).catch(() => 0);
-
-    if (reportLength > 500) {
-      log(`✅ Research complete! Report container has ${reportLength} characters.`);
-      return true;
-    }
-
-    await sleep(POLL_INTERVAL_MS);
-  }
-
-  log("⚠️  Max poll time reached. Research may or may not be complete.");
-  return false;
+    logSub("⚠️  Tempo máximo de polling atingido.");
+    return false;
 }
 
-async function extractResponseContent(page) {
-  log('Extracting research content from page DOM...');
+// ─── Export to Google Docs ─────────────────────────────────────────────────────
 
-  // Gemini Deep Research renders the full report in an immersive right panel.
-  // The report container is: div.container[scrollable="true"]
-  // We need to scroll through it to ensure all content is loaded, then extract.
+async function exportToGoogleDocs(page) {
+    logStep(5, "📤 Exportando para o Google Docs...");
 
-  // First, try to scroll the report container to load all lazy content
-  await page.evaluate(async () => {
-    const container = document.querySelector('.container[scrollable="true"]');
-    if (container) {
-      // Scroll to bottom in steps to trigger lazy loading
-      const scrollStep = 1000;
-      let scrollTop = 0;
-      while (scrollTop < container.scrollHeight) {
-        scrollTop += scrollStep;
-        container.scrollTop = scrollTop;
-        await new Promise(r => setTimeout(r, 200));
-      }
-      // Scroll back to top
-      container.scrollTop = 0;
+    // Click "Compartilhar e exportar" button
+    logSub('Clicando "Compartilhar e exportar"...');
+    const exportBtn = page.locator('button[data-test-id="export-menu-button"]').first();
+    await exportBtn.waitFor({ state: "visible", timeout: 10_000 });
+    await exportBtn.click();
+    await page.waitForTimeout(1500);
+    logSub("✅ Menu aberto.");
+
+    // Click "Exportar para o Google Docs"
+    logSub('Clicando "Exportar para o Google Docs"...');
+    const docsBtn = page.locator('button[data-test-id="export-to-docs-button"]').first();
+    await docsBtn.waitFor({ state: "visible", timeout: 5_000 });
+    await docsBtn.click();
+    logSub("✅ Exportação iniciada.");
+
+    // Wait for Google Docs to open in a new tab
+    logSub("Aguardando Google Docs abrir...");
+
+    // The export creates a Google Doc and may show a toast/notification with a link,
+    // or open a new tab. We wait for a new page to appear.
+    let docsPage = null;
+    const maxWait = 30_000;
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < maxWait) {
+        const pages = page.context().pages();
+        for (const p of pages) {
+            const url = p.url();
+            if (url.includes("docs.google.com/document")) {
+                docsPage = p;
+                break;
+            }
+        }
+        if (docsPage) break;
+
+        // Also check for a toast notification with a link to the Doc
+        try {
+            const docsLink = page.locator('a[href*="docs.google.com/document"]').first();
+            if (await docsLink.isVisible({ timeout: 1000 }).catch(() => false)) {
+                const href = await docsLink.getAttribute("href");
+                logSub(`Link encontrado: ${href}`);
+                // Open in same tab context
+                docsPage = await page.context().newPage();
+                await docsPage.goto(href, { waitUntil: "domcontentloaded", timeout: 30_000 });
+                break;
+            }
+        } catch {
+            // ignore
+        }
+
+        await sleep(2000);
     }
-  }).catch(() => { });
 
-  await page.waitForTimeout(2000);
+    if (!docsPage) {
+        // Fallback: check for snackbar/toast with "Abrir documento"
+        logSub('Procurando botão "Abrir documento" no toast...');
+        try {
+            const openDocBtn = page.locator('text=/Abrir documento|Open document|Abrir no Docs|Open in Docs/i').first();
+            await openDocBtn.waitFor({ state: "visible", timeout: 10_000 });
 
-  const content = await page.evaluate(() => {
-    // Strategy 1 (PRIMARY): Immersive report container
-    // This is the right panel in Gemini's Deep Research split-view
-    const reportContainer = document.querySelector('.container[scrollable="true"]');
-    if (reportContainer) {
-      const text = reportContainer.innerText;
-      if (text && text.trim().length > 200) {
-        return text.trim();
-      }
+            // Get the link or click to open new tab
+            const [newPage] = await Promise.all([
+                page.context().waitForEvent("page", { timeout: 15_000 }),
+                openDocBtn.click(),
+            ]);
+            docsPage = newPage;
+        } catch (err) {
+            throw new Error(`Google Docs não abriu após exportação: ${err.message}`);
+        }
     }
 
-    // Strategy 2: Look for model response containers
-    const responseSelectors = [
-      'model-response .markdown',
-      'model-response message-content',
-      'message-content .markdown',
-      '[data-message-author-role="model"] .markdown',
+    await docsPage.waitForLoadState("domcontentloaded");
+    await docsPage.waitForTimeout(3000);
+    logSub(`✅ Google Docs aberto: ${docsPage.url().substring(0, 60)}...`);
+
+    return docsPage;
+}
+
+// ─── Download EPUB from Google Docs ────────────────────────────────────────────
+
+async function downloadEpubFromDocs(docsPage) {
+    logStep(6, "📥 Baixando EPUB do Google Docs...");
+
+    // Click File menu (Arquivo)
+    logSub('Abrindo menu "Arquivo"...');
+    const fileMenu = docsPage.locator('#docs-file-menu').first();
+    await fileMenu.waitFor({ state: "visible", timeout: 10_000 });
+    await fileMenu.click();
+    await docsPage.waitForTimeout(1500);
+    logSub("✅ Menu Arquivo aberto.");
+
+    // Click "Download" / "Baixar" / "Fazer download" submenu
+    logSub('Clicando "Baixar"...');
+
+    // Google Docs uses specific menu item IDs — try multiple approaches
+    let downloadClicked = false;
+    const downloadSelectors = [
+        ':scope [id*="download"]',
+        ':scope .goog-menuitem:has-text("download")',
     ];
 
-    for (const sel of responseSelectors) {
-      const elements = document.querySelectorAll(sel);
-      if (elements.length > 0) {
-        const lastEl = elements[elements.length - 1];
-        if (lastEl.innerText && lastEl.innerText.trim().length > 200) {
-          return lastEl.innerText.trim();
+    // First try: look for menu item by ID
+    for (const sel of downloadSelectors) {
+        try {
+            const item = docsPage.locator(sel).first();
+            if (await item.isVisible({ timeout: 2_000 }).catch(() => false)) {
+                await item.click();
+                downloadClicked = true;
+                break;
+            }
+        } catch {
+            // try next
         }
-      }
     }
 
-    // Strategy 3: Find the element with the most text content
-    const candidates = document.querySelectorAll(
-      'message-content, .message-content, [class*="response"], .markdown'
-    );
-
-    let longestText = '';
-    for (const el of candidates) {
-      const text = (el.innerText || '').trim();
-      if (text.length > longestText.length) {
-        longestText = text;
-      }
+    // Second try: look for text-based match
+    if (!downloadClicked) {
+        const downloadItem = docsPage.getByText(/Fazer download|Baixar|Download/i).first();
+        await downloadItem.waitFor({ state: "visible", timeout: 5_000 });
+        await downloadItem.click();
+        downloadClicked = true;
     }
 
-    if (longestText.length > 200) {
-      return longestText;
-    }
+    await docsPage.waitForTimeout(1500);
+    logSub("✅ Submenu download aberto.");
 
-    // Strategy 4: Last resort — main content area
-    const mainArea = document.querySelector('main, [role="main"]');
-    if (mainArea) {
-      return mainArea.innerText.trim();
-    }
+    // Click EPUB option
+    logSub('Selecionando EPUB...');
+    const epubOption = docsPage.getByText(/EPUB/i).first();
+    await epubOption.waitFor({ state: "visible", timeout: 5_000 });
 
-    return '';
-  });
+    // Wait for download event
+    const downloadPromise = docsPage.waitForEvent("download", { timeout: 30_000 });
+    await epubOption.click();
 
-  if (!content || content.trim().length < 200) {
-    log(`DOM extraction got only ${(content || '').length} characters, trying clipboard fallback...`);
-    return await copyViaClipboard(page);
-  }
+    logSub("Aguardando download...");
+    const download = await downloadPromise;
 
-  log(`✅ Extracted ${content.length} characters from DOM.`);
-  return content;
+    // Save to Downloads
+    const suggestedName = download.suggestedFilename();
+    const savePath = resolve(DOWNLOADS_DIR, suggestedName);
+    await download.saveAs(savePath);
+
+    logSub(`✅ EPUB baixado: ${suggestedName}`);
+    logSub(`   Caminho: ${savePath}`);
+
+    return savePath;
 }
 
-async function copyViaClipboard(page) {
-  log('Attempting clipboard-based copy as fallback...');
+// ─── Send to Kindle ────────────────────────────────────────────────────────────
 
-  // Try to find and click the Copy button using various patterns
-  const copySelectors = [
-    'button[aria-label*="copi"]',        // "Copiar" / "Copy" (case-insensitive via aria)
-    'button[data-tooltip*="Copiar"]',
-    'button[data-tooltip*="Copy"]',
-    'button[mattooltip*="Copiar"]',
-    'button[mattooltip*="Copy"]',
-  ];
+async function sendToKindle(page, epubPath) {
+    logStep(7, "📧 Enviando EPUB para o Kindle...");
 
-  for (const selector of copySelectors) {
+    // Navigate to Send to Kindle
+    logSub(`Navegando para ${SEND_TO_KINDLE_URL}...`);
+    await page.goto(SEND_TO_KINDLE_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+    await page.waitForTimeout(3000);
+    logSub("✅ Página carregada.");
+
+    // Upload file using the "Select files from device" button
+    logSub("Fazendo upload do EPUB...");
+
+    // The button triggers a file chooser
+    const uploadBtn = page.locator('#s2k-dnd-add-your-files-button, button:has-text("Selecionar arquivos"), button:has-text("Select files")').first();
+    await uploadBtn.waitFor({ state: "visible", timeout: 10_000 });
+
+    const [fileChooser] = await Promise.all([
+        page.waitForEvent("filechooser", { timeout: 15_000 }),
+        uploadBtn.click(),
+    ]);
+    await fileChooser.setFiles(epubPath);
+    logSub("✅ Arquivo selecionado.");
+
+    // Wait for the file to be processed/uploaded
+    logSub("Aguardando processamento...");
+    await page.waitForTimeout(5000);
+
+    // Click Send button
+    logSub('Clicando "Enviar"...');
+    const sendBtn = page.locator('#s2k-r2s-send-button, button:has-text("Enviar"), button:has-text("Send")').first();
+    await sendBtn.waitFor({ state: "visible", timeout: 15_000 });
+    await sendBtn.click();
+
+    logSub("Aguardando confirmação...");
+    await page.waitForTimeout(5000);
+
+    // Check for success
     try {
-      const btns = page.locator(selector);
-      const count = await btns.count();
-      if (count > 0) {
-        // Click the last matching button (closest to the latest response)
-        await btns.last().click();
-        await page.waitForTimeout(2000);
-        const clipboard = readClipboard();
-        if (clipboard.trim().length > 100) {
-          log(`Clipboard fallback succeeded: ${clipboard.length} characters.`);
-          return clipboard;
-        }
-      }
+        const success = page.locator('text=/enviado|sent|sucesso|success|entregue|delivered/i').first();
+        await success.waitFor({ state: "visible", timeout: 15_000 });
+        logSub("✅ EPUB enviado ao Kindle com sucesso!");
     } catch {
-      continue;
+        logSub("⚠️  Confirmação não detectada, mas comando executado.");
     }
-  }
-
-  throw new Error('Could not extract research content. Try copying manually.');
-}
-
-// ─── HTML & Kindle ─────────────────────────────────────────────────────────────
-
-function saveHtml(query, clipboardContent) {
-  const title = query.substring(0, 80);
-  const filename = `${sanitizeFilename(query)}.html`;
-  const filepath = resolve(DOWNLOADS_DIR, filename);
-
-  const html = buildHtml(title, clipboardContent);
-  writeFileSync(filepath, html, "utf-8");
-
-  log(`📄 HTML saved: ${filepath}`);
-  return filepath;
-}
-
-const GMAIL_COMPOSER_URL = "https://mail.google.com/mail/?view=cm&fs=1&to=gg_Ac98@kindle.com&su=Convert&body=Deep+Research+Report";
-
-async function sendViaGmailWeb(page, htmlFilePath) {
-  log("Opening Gmail...");
-  await page.goto(GMAIL_COMPOSER_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
-
-  // Wait for the Compose window to load
-  // The "Send" button is a good indicator that the composer is ready
-  // It usually has aria-label="Send" or "Enviar"
-  log("Waiting for Gmail Composer...");
-  const sendBtn = page.locator('div[role="button"][aria-label*="Enviar"], div[role="button"][aria-label*="Send"]').first();
-  try {
-    await sendBtn.waitFor({ state: "visible", timeout: 20_000 });
-  } catch {
-    // Fallback: check for the "To" field or Subject field if Send button isn't found immediately
-    await page.locator('input[name="subjectbox"]').waitFor({ state: "visible", timeout: 10_000 });
-  }
-  log("Gmail Composer ready.");
-
-  // --- Attach File ---
-  log("Attaching file...");
-
-  // The attach button usually has a paperclip icon and command="Files" or aria-label="Attach files"/"Anexar arquivos"
-  const attachBtn = page.locator('div[command="Files"], div[aria-label="Anexar arquivos"], div[aria-label="Attach files"]').first();
-  await attachBtn.waitFor({ state: "visible", timeout: 10_000 });
-
-  const [fileChooser] = await Promise.all([
-    page.waitForEvent("filechooser", { timeout: 15_000 }),
-    attachBtn.click(),
-  ]);
-  await fileChooser.setFiles(htmlFilePath);
-  log("File selected.");
-
-  // Wait for attachment to upload
-  // The attachment usually appears as a card/link. We can wait a bit or look for a progress bar to disappear.
-  // A safe bet is getting the file size (which means it's processed).
-  // "div[role='progressbar']" might appear during upload.
-  log("Waiting for attachment upload...");
-  await page.waitForTimeout(5000); // Give it time to upload (HTML files are small)
-
-  // Verify attachment presence (optional but good) via aria-label containing filename
-  const fileName = htmlFilePath.split("/").pop();
-  const attachmentIndicator = page.locator(`div[aria-label*="${fileName}"]`);
-  if (await attachmentIndicator.count() > 0) {
-    log("Attachment verified.");
-  }
-
-  // --- Send ---
-  log("Sending email...");
-  // Press Ctrl+Enter (Cmd+Enter on Mac) to send - faster and more reliable than finding the button
-  await page.keyboard.press('Meta+Enter'); // Mac
-  // Fallback: click send if keyboard shortcut doesn't trigger navigation/toast
-  await page.waitForTimeout(1000);
-
-  // Check if sent
-  // Look for "Message sent" / "Mensagem enviada" toast
-  // Or simply wait for the page to change (since ?view=cm usually closes or clears after send)
-
-  try {
-    log("Waiting for confirmation...");
-    await page.locator('text=/Mensagem enviada|Message sent/i').waitFor({ state: "visible", timeout: 10_000 });
-    log("✅ Email sent successfully!");
-  } catch {
-    // If we're in the dedicated window mode (?view=cm), it might close or redirect to Inbox on send.
-    // If the URL changed to inbox, or the composer cleared, it's likely sent.
-    log("⚠️  Confirmation toast not detected, but command executed.");
-  }
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const args = process.argv.slice(2);
+    const args = process.argv.slice(2);
 
-  // Parse --profile argument
-  let profilePath = undefined;
-  const profileIndex = args.indexOf("--profile");
-  if (profileIndex !== -1 && args[profileIndex + 1]) {
-    profilePath = resolve(process.cwd(), args[profileIndex + 1]);
-    // Remove the flag and value from args so they don't interfere with other parsing
-    args.splice(profileIndex, 2);
-  }
+    // Parse --profile
+    let profilePath = undefined;
+    const profileIndex = args.indexOf("--profile");
+    if (profileIndex !== -1 && args[profileIndex + 1]) {
+        profilePath = resolve(process.cwd(), args[profileIndex + 1]);
+        args.splice(profileIndex, 2);
+    }
 
-  const loginOnly = args.includes("--login-only");
-  const kindleOnly = args.includes("--kindle-only");
-  const query = args.filter((a) => !a.startsWith("--")).join(" ");
+    // Parse --model
+    let modelArg = undefined;
+    const modelIndex = args.indexOf("--model");
+    if (modelIndex !== -1 && args[modelIndex + 1]) {
+        modelArg = args[modelIndex + 1];
+        args.splice(modelIndex, 2);
+    }
 
-  if (!loginOnly && !kindleOnly && !query) {
-    console.log(`
+    const loginOnly = args.includes("--login-only");
+    const sendOnly = args.includes("--send-only");
+    const skipKindle = args.includes("--no-kindle");
+    const query = args.filter((a) => !a.startsWith("--")).join(" ");
+
+    // --- Help ---
+    if (!loginOnly && !sendOnly && !query) {
+        console.log(`
 📚 Deep Research to Kindle (DRK)
 
-Usage:
-  node drk.mjs "Your research query"        Full automation flow
-  node drk.mjs --login-only                 Open browser to log in (first-time setup)
-  node drk.mjs --kindle-only <path>         Send an existing HTML file via Gmail
-  node drk.mjs --profile <path>             Use a specific browser profile directory
+Fluxo: Gemini → Google Docs → EPUB → Send to Kindle
 
-Options:
-  --login-only    Just open the browser for manual login (Google), then exit
-  --no-kindle     Skip the email delivery step (just generate HTML)
-  --kindle-only   Skip research, just send a file via Gmail to Kindle
-  --profile       Path to a custom browser profile directory (e.g., to share sessions)
+Uso:
+  node drk.mjs "Sua query de pesquisa"            Pesquisa completa (modelo: Raciocínio)
+  node drk.mjs --model flash "query"               Usar modelo Flash
+  node drk.mjs --model pro "query"                 Usar modelo Pro
+  node drk.mjs --send-only <gemini-url>            Exportar pesquisa existente para Kindle
+  node drk.mjs --login-only                        Abrir browser para login
 
-Examples:
-  node drk.mjs "What are the latest advances in CRISPR?"
-  node drk.mjs --login-only
-  node drk.mjs --profile ./my-custom-profile --login-only
-  node drk.mjs --kindle-only ~/Downloads/My-Report.html
+Modelos:
+  flash | rapido     ⚡ Rápido (Flash)
+  thinking | raciocinio   🧠 Raciocínio (Thinking) [PADRÃO]
+  pro                🚀 Pro
 
-Note:
-  Authentication relies on your persistent browser profile.
-  Default profile: ~/.drk-profile
-  Target: gg_Ac98@kindle.com
+Opções:
+  --model <nome>    Escolher modelo (padrão: raciocínio)
+  --login-only      Apenas login manual (Google + Amazon)
+  --no-kindle       Exportar e baixar EPUB, sem enviar ao Kindle
+  --send-only       Abrir pesquisa existente e enviar (pula a pesquisa)
+  --profile         Caminho para perfil customizado
+
+Exemplos:
+  node drk.mjs "Quais os avanços recentes em edição genética CRISPR?"
+  node drk.mjs --model pro "História da arquitetura medieval"
+  node drk.mjs --send-only https://gemini.google.com/app/1de4d1cd9d823b42
 `);
-    process.exit(0);
-  }
+        process.exit(0);
+    }
 
-  const skipKindle = args.includes("--no-kindle");
+    logBanner();
 
-  const { context, page } = await launchBrowser(profilePath);
-
-  try {
+    // --- Login-only ---
     if (loginOnly) {
-      log("🔑 Login mode — browser is open.");
-      log(`   Profile: ${profilePath || PROFILE_DIR}`);
-      log("   Please log in to Gmail (giusepegraciolli@gmail.com).");
-      log("   Also ensure you are logged into Gemini.");
-      log("   Press Ctrl+C when done.");
-      await navigateToGemini(page);
-      // Keep alive until user closes
-      await new Promise(() => { });
+        const { context, page } = await launchBrowser(profilePath);
+        log("🔑 Modo login — browser aberto.");
+        logSub(`Perfil: ${profilePath || PROFILE_DIR}`);
+        logSub("Faça login no Google (Gemini, Docs, Gmail) e Amazon.");
+        logSub("Pressione Ctrl+C quando terminar.");
+        await navigateToGemini(page);
+        await new Promise(() => { });
     }
 
-    if (kindleOnly) {
-      // Send an existing file via Gmail (skip research)
-      const filePath = query || resolve(DOWNLOADS_DIR, "What-are-the-latest-advances-in-CRISPR-gene-editing-in-2025.html");
-      if (!existsSync(filePath)) {
-        throw new Error(`File not found: ${filePath}`);
-      }
-      log(`Kindle-only mode: sending ${filePath}`);
-      await sendViaGmailWeb(page, filePath);
-      log("🎉 Done!");
-      await context.close();
-      return;
+    // --- Send-only mode (existing research) ---
+    if (sendOnly) {
+        const geminiUrl = query;
+        if (!geminiUrl || !geminiUrl.includes("gemini.google.com")) {
+            log("❌ Forneça a URL de uma pesquisa Gemini existente.");
+            process.exit(1);
+        }
+
+        const { context, page } = await launchBrowser(profilePath);
+        try {
+            logStep(2, "🌐 Navegando para a pesquisa existente...");
+            logSub(`URL: ${geminiUrl}`);
+            await page.goto(geminiUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+            await page.waitForTimeout(5000);
+            logSub("✅ Página carregada.");
+
+            const docsPage = await exportToGoogleDocs(page);
+            const epubPath = await downloadEpubFromDocs(docsPage);
+
+            // Close the Docs tab
+            await docsPage.close();
+
+            if (!skipKindle) {
+                await sendToKindle(page, epubPath);
+            } else {
+                log("⏭️  Envio ao Kindle pulado (--no-kindle).");
+            }
+
+            console.log();
+            log(SEPARATOR);
+            log("🎉 Concluído!");
+            log(`   EPUB: ${epubPath}`);
+            log(SEPARATOR);
+        } catch (err) {
+            log(`❌ Erro: ${err.message}`);
+            console.error(err);
+            process.exit(1);
+        } finally {
+            await context.close();
+        }
+        return;
     }
+
+    // --- Model selection (default: Raciocínio, override with --model) ---
+    const model = resolveModel(modelArg);
+    log(`Modelo: ${model.label}`);
+    console.log();
 
     // --- Full automation flow ---
-    await navigateToGemini(page);
-    await enableDeepResearch(page);
-    await submitQuery(page, query);
-    await confirmResearchStart(page);
-    await pollForCompletion(page);
-    // Extract content directly from the page DOM (much more reliable than clipboard)
-    const researchContent = await extractResponseContent(page);
-    if (!researchContent || researchContent.trim().length < 100) {
-      throw new Error("Could not extract research content. Try copying manually from the browser.");
+    const { context, page } = await launchBrowser(profilePath);
+
+    try {
+        await navigateToGemini(page);
+        await selectModel(page, model);
+        await enableDeepResearch(page);
+        await submitQuery(page, query);
+        await confirmResearchStart(page);
+        await pollForCompletion(page);
+
+        // Export to Google Docs
+        const docsPage = await exportToGoogleDocs(page);
+
+        // Download EPUB
+        const epubPath = await downloadEpubFromDocs(docsPage);
+
+        // Close the Docs tab
+        await docsPage.close();
+
+        // Send to Kindle
+        if (!skipKindle) {
+            await sendToKindle(page, epubPath);
+        } else {
+            logStep(7, "⏭️  Envio ao Kindle pulado (--no-kindle).");
+        }
+
+        console.log();
+        log(SEPARATOR);
+        log("🎉 Concluído!");
+        log(`   EPUB: ${epubPath}`);
+        if (!skipKindle) {
+            log("   Enviado ao Kindle via Send to Kindle.");
+        }
+        log(SEPARATOR);
+    } catch (err) {
+        log(`❌ Erro: ${err.message}`);
+        console.error(err);
+        process.exit(1);
+    } finally {
+        await context.close();
     }
-    log(`Research content: ${researchContent.length} characters.`);
-
-    const htmlFilePath = saveHtml(query, researchContent);
-
-    if (!skipKindle) {
-      await sendViaGmailWeb(page, htmlFilePath);
-    } else {
-      log("⏭️  Skipping email delivery (--no-kindle flag).");
-    }
-
-    log("🎉 Done!");
-  } catch (err) {
-    log(`❌ Error: ${err.message}`);
-    console.error(err);
-    process.exit(1);
-  } finally {
-    await context.close();
-  }
 }
 
 main();
