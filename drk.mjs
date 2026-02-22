@@ -166,16 +166,20 @@ async function selectModel(page, model) {
 
 async function enableDeepResearch(page) {
     logSub("🔬 Ativando Deep Research...");
-    const toolsBtn = page.getByRole("button", { name: /Ferramentas/i });
-    await toolsBtn.waitFor({ state: "visible", timeout: 10_000 });
-    await toolsBtn.click();
-    await page.waitForTimeout(1500);
+    try {
+        const toolsBtn = page.getByRole("button", { name: /Ferramentas/i });
+        await toolsBtn.waitFor({ state: "visible", timeout: 10_000 });
+        await toolsBtn.click();
+        await page.waitForTimeout(1500);
 
-    const drBtn = page.locator("text=/Deep Research/i");
-    await drBtn.waitFor({ state: "visible", timeout: 5_000 });
-    await drBtn.click();
-    await page.waitForTimeout(2000);
-    logSub("✅ Deep Research ativado.");
+        const drBtn = page.locator("text=/Deep Research/i");
+        await drBtn.waitFor({ state: "visible", timeout: 5_000 });
+        await drBtn.click();
+        await page.waitForTimeout(2000);
+        logSub("✅ Deep Research ativado.");
+    } catch (err) {
+        logSub("⚠️ Botão de Deep Research não encontrado. Continuando pesquisa normal...");
+    }
 }
 
 async function submitQuery(page, query) {
@@ -598,9 +602,16 @@ Exemplos:
         const { context, page } = await launchBrowser(profilePath);
         log("🔑 Modo login — browser aberto.");
         logSub(`Perfil: ${profilePath || PROFILE_DIR}`);
-        logSub("Faça login no Google (Gemini, Docs, Gmail) e Amazon.");
+        logSub("Faça login no Google (Gemini, Docs, Gmail), Amazon e Claude.");
         logSub("Pressione Ctrl+C quando terminar.");
         await navigateToGemini(page);
+
+        const kindlePage = await context.newPage();
+        await kindlePage.goto(SEND_TO_KINDLE_URL, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => { });
+
+        const claudePage = await context.newPage();
+        await claudePage.goto("https://claude.ai", { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => { });
+
         await new Promise(() => { });
     }
 
@@ -689,6 +700,9 @@ Exemplos:
         log(SEPARATOR);
     } catch (err) {
         log(`❌ Erro: ${err.message}`);
+        if (typeof page !== 'undefined' && page) {
+            try { await page.screenshot({ path: 'error.png' }); } catch (e) { }
+        }
         console.error(err);
         process.exit(1);
     } finally {
